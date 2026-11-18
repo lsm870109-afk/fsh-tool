@@ -11,8 +11,13 @@
  <div id="status" class="status muted" style="margin-top:12px">FSH 파일을 선택하세요.</div>
 </div>
 <div class="panel">
- <div class="row"><label for="strength">만화풍 강도 <b id="sv">55%</b></label><input id="strength" type="range" min="0" max="100" value="55"><button id="convert" disabled>선택 파일 변환·저장</button></div>
- <div class="muted">색상 단계 단순화 + 채도/대비 조정 + 윤곽선 강조. 원본 FSH의 헤더와 나머지 바이트는 유지합니다.</div>
+ <div class="row"><label for="strength">전체 카툰 강도 <b id="sv">55%</b></label><input id="strength" type="range" min="0" max="100" value="55"><button id="convert" disabled>선택 파일 변환·저장</button></div>
+ <div class="row" style="margin-top:12px"><label for="smooth">피부 질감 정리 <b id="smoothv">35%</b></label><input id="smooth" type="range" min="0" max="100" value="35"></div>
+ <div class="row"><label for="blur">블러 <b id="blurv">0</b></label><input id="blur" type="range" min="0" max="4" step="1" value="0"></div>
+ <div class="row"><label for="sharp">눈·코·입 선명도 <b id="sharpv">35%</b></label><input id="sharp" type="range" min="0" max="100" value="35"></div>
+ <div class="row"><label for="levels">색상 단계 <b id="levelsv">12</b></label><input id="levels" type="range" min="4" max="32" value="12"></div>
+ <div class="row"><label for="edge">윤곽선 강조 <b id="edgev">35%</b></label><input id="edge" type="range" min="0" max="100" value="35"></div>
+ <div class="muted">피부 정리 → 블러 → 선명도 복원 → 색상 단순화 → 윤곽 강조 순서로 브라우저에서 처리합니다. 원본 FSH는 변경하지 않고 별도 파일로 저장합니다.</div>
 </div>
 <div class="panel preview">
  <section><h3>원본 얼굴 텍스처</h3><canvas id="before" width="512" height="512"></canvas></section>
@@ -104,26 +109,62 @@ function encodeLevel(img,lv,type){
  return out;
 }
 function canvasPut(canvas,pixels,w,h){canvas.width=w;canvas.height=h;const ctx=canvas.getContext("2d");ctx.putImageData(new ImageData(pixels,w,h),0,0);}
-function stylize(src,w,h,strength){
- const out=new Uint8ClampedArray(src),s=strength/100,levels=Math.max(5,Math.round(32-23*s)),sat=1+0.65*s,contrast=1+0.18*s;
+function boxBlur(src,w,h,radius){
+ if(radius<=0)return new Uint8ClampedArray(src);
+ const tmp=new Float32Array(src.length),out=new Uint8ClampedArray(src.length),r=radius;
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){let n=0,s=[0,0,0];for(let dx=-r;dx<=r;dx++){let xx=Math.max(0,Math.min(w-1,x+dx)),q=(y*w+xx)*4;n++;for(let k=0;k<3;k++)s[k]+=src[q+k];}let q=(y*w+x)*4;for(let k=0;k<3;k++)tmp[q+k]=s[k]/n;tmp[q+3]=src[q+3];}
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){let n=0,s=[0,0,0];for(let dy=-r;dy<=r;dy++){let yy=Math.max(0,Math.min(h-1,y+dy)),q=(yy*w+x)*4;n++;for(let k=0;k<3;k++)s[k]+=tmp[q+k];}let q=(y*w+x)*4;for(let k=0;k<3;k++)out[q+k]=s[k]/n;out[q+3]=src[q+3];}
+ return out;
+}
+function edgeMap(src,w,h){
  const lum=new Float32Array(w*h);
- for(let i=0;i<w*h;i++){const q=i*4;lum[i]=.299*src[q]+.587*src[q+1]+.114*src[q+2];}
- for(let y=0;y<h;y++)for(let x=0;x<w;x++){const i=y*w+x,q=i*4,a=src[q+3];let r=src[q],g=src[q+1],b=src[q+2],l=.299*r+.587*g+.114*b;
+ for(let i=0;i<w*h;i++){let q=i*4;lum[i]=.299*src[q]+.587*src[q+1]+.114*src[q+2];}
+ const edge=new Float32Array(w*h);
+ for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){let i=y*w+x,gx=Math.abs(lum[i+1]-lum[i-1]),gy=Math.abs(lum[i+w]-lum[i-w]);edge[i]=Math.min(1,(gx+gy)/110);}
+ return edge;
+}
+function stylize(src,w,h,strength,opts={}){
+ const s=strength/100,smooth=(opts.smooth??35)/100,blur=opts.blur??0,sharp=(opts.sharp??35)/100,levels=opts.levels??12,edgeAmt=(opts.edge??35)/100;
+ let work=new Uint8ClampedArray(src);
+ // Edge-aware local smoothing: nearby pixels with similar brightness are averaged more strongly.
+ if(smooth>0){
+  const sm=new Uint8ClampedArray(src.length),rad=2;
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+   let q=(y*w+x)*4,centerL=.299*src[q]+.587*src[q+1]+.114*src[q+2],sum=[0,0,0],ws=0;
+   for(let dy=-rad;dy<=rad;dy++)for(let dx=-rad;dx<=rad;dx++){
+    let xx=Math.max(0,Math.min(w-1,x+dx)),yy=Math.max(0,Math.min(h-1,y+dy)),p=(yy*w+xx)*4;
+    let l=.299*src[p]+.587*src[p+1]+.114*src[p+2],sp=Math.exp(-(dx*dx+dy*dy)/4),co=Math.exp(-Math.abs(l-centerL)/34),wt=sp*co;
+    ws+=wt;for(let k=0;k<3;k++)sum[k]+=src[p+k]*wt;
+   }
+   for(let k=0;k<3;k++)sm[q+k]=src[q+k]*(1-smooth*.85)+(sum[k]/ws)*(smooth*.85);
+   sm[q+3]=src[q+3];
+  }
+  work=sm;
+ }
+ if(blur>0)work=boxBlur(work,w,h,blur);
+ if(sharp>0){
+  const soft=boxBlur(work,w,h,1),out=new Uint8ClampedArray(work.length),amount=sharp*.9;
+  for(let i=0;i<work.length;i+=4){for(let k=0;k<3;k++)out[i+k]=Math.max(0,Math.min(255,work[i+k]+(work[i+k]-soft[i+k])*amount));out[i+3]=work[i+3];}
+  work=out;
+ }
+ const edge=edgeMap(work,w,h),out=new Uint8ClampedArray(work.length),sat=1+.45*s,contrast=1+.14*s,step=255/Math.max(3,levels-1);
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){let i=y*w+x,q=i*4,a=work[q+3],r=work[q],g=work[q+1],b=work[q+2],l=.299*r+.587*g+.114*b;
   r=l+(r-l)*sat;g=l+(g-l)*sat;b=l+(b-l)*sat;
   r=(r-128)*contrast+128;g=(g-128)*contrast+128;b=(b-128)*contrast+128;
-  const step=255/(levels-1);r=Math.round(Math.max(0,Math.min(255,r))/step)*step;g=Math.round(Math.max(0,Math.min(255,g))/step)*step;b=Math.round(Math.max(0,Math.min(255,b))/step)*step;
-  let edge=0;if(x>0&&x<w-1&&y>0&&y<h-1){const gx=Math.abs(lum[i+1]-lum[i-1]),gy=Math.abs(lum[i+w]-lum[i-w]);edge=Math.min(1,(gx+gy)/150)*s*.32;}
-  out[q]=r*(1-edge);out[q+1]=g*(1-edge);out[q+2]=b*(1-edge);out[q+3]=a;
+  r=Math.round(Math.max(0,Math.min(255,r))/step)*step;g=Math.round(Math.max(0,Math.min(255,g))/step)*step;b=Math.round(Math.max(0,Math.min(255,b))/step)*step;
+  const dark=1-Math.min(.72,edge[i]*edgeAmt*.72*s);
+  out[q]=r*dark;out[q+1]=g*dark;out[q+2]=b*dark;out[q+3]=a;
  }
  return out;
 }
+function getOptions(){return {smooth:+$("smooth").value,blur:+$("blur").value,sharp:+$("sharp").value,levels:+$("levels").value,edge:+$("edge").value};}
 function refresh(){
- if(selected<0)return;const r=records[selected],s=+$("strength").value;
+ if(selected<0)return;const r=records[selected],s=+$("strength").value,op=getOptions();
  canvasPut($("before"),r.pixels,r.e.width,r.e.height);
- const filtered=stylize(r.pixels,r.e.width,r.e.height,s);canvasPut($("after"),filtered,r.e.width,r.e.height);
- $("sv").textContent=s+"%";r.filtered=filtered;
+ const filtered=stylize(r.pixels,r.e.width,r.e.height,s,op);canvasPut($("after"),filtered,r.e.width,r.e.height);
+ $("sv").textContent=s+"%";$("smoothv").textContent=op.smooth+"%";$("blurv").textContent=op.blur;$("sharpv").textContent=op.sharp+"%";$("levelsv").textContent=op.levels;$("edgev").textContent=op.edge+"%";r.filtered=filtered;
 }
-$("strength").addEventListener("input",refresh);
+["strength","smooth","blur","sharp","levels","edge"].forEach(id=>$(id).addEventListener("input",refresh));
 $("analyze").onclick=async()=>{
  records=[];selected=-1;$("convert").disabled=true;$("list").textContent="";
  const files=[...$("files").files];if(!files.length){$("status").textContent="먼저 FSH 파일을 선택하세요.";return;}
@@ -134,7 +175,7 @@ $("convert").onclick=()=>{
  const s=+$("strength").value;
  for(const r of records){try{
   const b=r.bytes.slice(),e=r.e,levels=e.levels;let off=e.dataStart;
-  let base=stylize(r.pixels,e.width,e.height,s);
+  let base=stylize(r.pixels,e.width,e.height,s,getOptions());
   let encoded=encodeLevel(base,levels[0],e.type);b.set(encoded,off);off+=encoded.length;
   let prev=base,pw=e.width,ph=e.height;
   for(let i=1;i<levels.length;i++){const lv=levels[i],small=new Uint8ClampedArray(lv.w*lv.h*4);for(let y=0;y<lv.h;y++)for(let x=0;x<lv.w;x++){let sx=Math.min(pw-1,x*2),sy=Math.min(ph-1,y*2),q=(sy*pw+sx)*4,d=(y*lv.w+x)*4;small.set(prev.slice(q,q+4),d);}const enc=encodeLevel(small,lv,e.type);b.set(enc,off);off+=enc.length;prev=small;pw=lv.w;ph=lv.h;}
