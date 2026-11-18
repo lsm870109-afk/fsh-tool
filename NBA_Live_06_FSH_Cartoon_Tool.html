@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NBA Live 06 FSH Cartoon Tool</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101722;color:#e8eef8;font:15px system-ui,sans-serif}main{max-width:1100px;margin:auto;padding:24px}h1{font-size:23px;margin:0 0 8px}.muted{color:#9eacc0;font-size:13px}.panel{background:#1a2636;border:1px solid #33445a;border-radius:12px;padding:16px;margin:14px 0}.row{display:flex;gap:14px;align-items:center;flex-wrap:wrap}button,.filebtn{background:#3977c8;color:white;border:0;border-radius:8px;padding:10px 14px;font-weight:600;cursor:pointer}button:disabled{opacity:.4;cursor:not-allowed}input[type=file]{max-width:100%}input[type=range]{width:min(420px,90%)}canvas{max-width:100%;height:auto;background:#0b1119;border-radius:8px;image-rendering:auto}.preview{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}.preview section{min-width:0}.preview h3{font-size:14px;color:#c4d4e8}.status{white-space:pre-wrap;line-height:1.55}.item{padding:8px;border-bottom:1px solid #34445a;font-size:13px}.ok{color:#7ed9a4}.bad{color:#ff9d9d}
+</style></head><body><main>
+<h1>NBA Live 06 FSH Cartoon Tool</h1>
+<div class="muted">브라우저에서 로컬 파일만 처리합니다. 서버 업로드 없음. 현재 ShpF / DXT1(96), DXT3(97) 지원.</div>
+<div class="panel">
+ <div class="row"><input id="files" type="file" accept=".fsh" multiple><button id="analyze">파일 분석</button></div>
+ <div id="status" class="status muted" style="margin-top:12px">FSH 파일을 선택하세요.</div>
+</div>
+<div class="panel">
+ <div class="row"><label for="strength">만화풍 강도 <b id="sv">55%</b></label><input id="strength" type="range" min="0" max="100" value="55"><button id="convert" disabled>선택 파일 변환·저장</button></div>
+ <div class="muted">색상 단계 단순화 + 채도/대비 조정 + 윤곽선 강조. 원본 FSH의 헤더와 나머지 바이트는 유지합니다.</div>
+</div>
+<div class="panel preview">
+ <section><h3>원본 얼굴 텍스처</h3><canvas id="before" width="512" height="512"></canvas></section>
+ <section><h3>만화풍 미리보기</h3><canvas id="after" width="512" height="512"></canvas></section>
+</div>
+<div class="panel"><b>분석 파일 목록</b><div id="list" class="muted" style="margin-top:8px">아직 분석한 파일이 없습니다.</div></div>
+<script>
+const $=id=>document.getElementById(id);
+let records=[], selected=-1;
+const u32=(v,o,le=false)=>v.getUint32(o,le);
+function parseFSH(buf,name){
+ const b=new Uint8Array(buf),v=new DataView(buf);
+ if(String.fromCharCode(...b.slice(0,4))!=="ShpF")throw Error("ShpF 형식이 아닙니다.");
+ const fileSize=u32(v,4,true),count=u32(v,8,false),toc=u32(v,12,false);
+ if(count<1||count>128||toc<16||toc>buf.byteLength)throw Error("헤더/디렉터리 값이 비정상입니다.");
+ let p=16,entries=[];
+ for(let i=0;i<count;i++){
+  if(p+8>buf.byteLength)throw Error("디렉터리가 파일 범위를 벗어났습니다.");
+  const off=u32(v,p,false),size=u32(v,p+4,false);p+=8;
+  let e=p;while(p<buf.byteLength&&b[p]!==0)p++;
+  if(p>=buf.byteLength)throw Error("디렉터리 태그 문자열이 끝나지 않았습니다.");
+  const tag=new TextDecoder().decode(b.slice(e,p));p++;
+  entries.push({off,size,tag});
+ }
+ entries.sort((a,b)=>a.off-b.off);
+ for(let i=0;i<entries.length;i++){
+  const e=entries[i],end=i+1<entries.length?entries[i+1].off:Math.min(fileSize,buf.byteLength);
+  if(e.off+32>end||end>buf.byteLength)throw Error("이미지 엔트리 범위가 잘못되었습니다.");
+  e.end=end;e.type=b[e.off];e.flags=b[e.off+1]|(b[e.off+2]<<8)|(b[e.off+3]<<16);
+  e.rel=u32(v,e.off+8,true);e.dataStart=e.off+e.rel;
+  e.width=u32(v,e.off+24,true);e.height=u32(v,e.off+28,true);
+  e.mips=(e.flags>>>20)&15;
+ }
+ const e=entries.find(x=>/texture0:head/i.test(x.tag))||entries.find(x=>[96,97].includes(x.type));
+ if(!e)throw Error("얼굴 텍스처 엔트리를 찾지 못했습니다.");
+ if(![96,97].includes(e.type))throw Error("현재 지원하지 않는 이미지 형식: "+e.type+" (지원: 96 DXT1, 97 DXT3)");
+ if(!e.width||!e.height||e.width>4096||e.height>4096)throw Error("이미지 크기를 확인할 수 없습니다.");
+ const bytesPerBlock=e.type===96?8:16;
+ let total=0,w=e.width,h=e.height,levels=[];
+ for(let i=0;i<=e.mips;i++){let n=Math.ceil(w/4)*Math.ceil(h/4)*bytesPerBlock;levels.push({w,h,bytes:n});total+=n;w=Math.max(1,w>>1);h=Math.max(1,h>>1);}
+ const dataEnd=e.end,available=dataEnd-e.dataStart;
+ if(total!==available)throw Error("압축 데이터 길이 불일치: 예상 "+total+" / 실제 "+available+" (안전상 저장 중단)");
+ e.levels=levels;e.dataEnd=dataEnd;e.dataLength=total;
+ const pixels=decodeLevel(b,e,e.levels[0],e.dataStart);
+ return {name,buf,bytes:b,entries,e,pixels};
+}
+function rgb565(n){return [((n>>11)&31)*255/31,((n>>5)&63)*255/63,(n&31)*255/31]}
+function to565(p){return ((Math.round(p[0]*31/255)<<11)|(Math.round(p[1]*63/255)<<5)|Math.round(p[2]*31/255))&65535}
+function decodeColor(d,o,transparent){
+ const a=d[o]|(d[o+1]<<8),b=d[o+2]|(d[o+3]<<8),c0=rgb565(a),c1=rgb565(b),pal=[c0,c1];
+ if(a>b||!transparent){pal.push(c0.map((x,i)=>(2*x+c1[i])/3),c0.map((x,i)=>(x+2*c1[i])/3));}
+ else{pal.push(c0.map((x,i)=>(x+c1[i])/2),[0,0,0]);}
+ let bits=(d[o+4]|(d[o+5]<<8)|(d[o+6]<<16)|(d[o+7]<<24))>>>0, out=[];
+ for(let i=0;i<16;i++){let k=(bits>>>(2*i))&3;out.push([...pal[k],(transparent&&a<=b&&k===3)?0:255]);}
+ return out;
+}
+function decodeLevel(b,e,lv,offset){
+ const out=new Uint8ClampedArray(lv.w*lv.h*4),blocksX=Math.ceil(lv.w/4),blocksY=Math.ceil(lv.h/4);let p=offset;
+ for(let by=0;by<blocksY;by++)for(let bx=0;bx<blocksX;bx++){
+  let alpha=null,co;
+  if(e.type===96){co=decodeColor(b,p,true);p+=8;}
+  else{
+   alpha=[];for(let i=0;i<8;i++)alpha.push(b[p+i]);let ab=0n;for(let i=0;i<6;i++)ab|=BigInt(b[p+2+i])<<BigInt(8*i);
+   const a0=alpha[0],a1=alpha[1],ap=[a0,a1];
+   if(a0>a1){for(let i=1;i<=6;i++)ap.push(((7-i)*a0+i*a1)/7);}
+   else{for(let i=1;i<=4;i++)ap.push(((5-i)*a0+i*a1)/5);ap.push(0,255);}
+   const cols=decodeColor(b,p+8,false);co=cols;
+   for(let i=0;i<16;i++){const ix=Number((ab>>BigInt(3*i))&7n);co[i][3]=Math.round(ap[ix]);}p+=16;
+  }
+  for(let py=0;py<4;py++)for(let px=0;px<4;px++){const x=bx*4+px,y=by*4+py;if(x>=lv.w||y>=lv.h)continue;const c=co[py*4+px],q=(y*lv.w+x)*4;out[q]=c[0];out[q+1]=c[1];out[q+2]=c[2];out[q+3]=c[3];}
+ }
+ return out;
+}
+function encodeColorBlock(px,transparent){
+ let opaque=px.filter(p=>p[3]>=128);if(!opaque.length)opaque=[[0,0,0,255]];
+ let lo=[255,255,255],hi=[0,0,0];for(const p of opaque)for(let k=0;k<3;k++){lo[k]=Math.min(lo[k],p[k]);hi[k]=Math.max(hi[k],p[k]);}
+ let c0=to565(hi),c1=to565(lo);
+ if(transparent){if(c0>c1){let t=c0;c0=c1;c1=t;}}
+ else if(c0<=c1){let t=c0;c0=c1;c1=t;if(c0===c1)c0=Math.min(65535,c0+1);}
+ let a=rgb565(c0),b=rgb565(c1),pal=[a,b];
+ if(c0>c1||!transparent)pal.push(a.map((x,i)=>(2*x+b[i])/3),a.map((x,i)=>(x+2*b[i])/3));else pal.push(a.map((x,i)=>(x+b[i])/2),[0,0,0]);
+ let bits=0;for(let i=0;i<16;i++){let p=px[i],idx=0;if(transparent&&p[3]<128)idx=3;else{let best=1e30;for(let j=0;j<(transparent&&c0<=c1?3:4);j++){let dist=0;for(let k=0;k<3;k++)dist+=(p[k]-pal[j][k])**2;if(dist<best){best=dist;idx=j;}}}bits|=idx<<(2*i);}
+ return [c0&255,c0>>8,c1&255,c1>>8,bits&255,(bits>>>8)&255,(bits>>>16)&255,(bits>>>24)&255];
+}
+function encodeLevel(img,lv,type){
+ const out=new Uint8Array(Math.ceil(lv.w/4)*Math.ceil(lv.h/4)*(type===96?8:16));let p=0;
+ for(let by=0;by<Math.ceil(lv.h/4);by++)for(let bx=0;bx<Math.ceil(lv.w/4);bx++){
+  const px=[];for(let y=0;y<4;y++)for(let x=0;x<4;x++){let xx=Math.min(lv.w-1,bx*4+x),yy=Math.min(lv.h-1,by*4+y),q=(yy*lv.w+xx)*4;px.push([img[q],img[q+1],img[q+2],img[q+3]]);}
+  if(type===97){let ab=0n;for(let i=0;i<16;i++){let a=Math.max(0,Math.min(15,Math.round(px[i][3]/17)));ab|=BigInt(a)<<BigInt(4*i);}for(let i=0;i<8;i++)out[p++]=Number((ab>>BigInt(8*i))&255n);}
+  const cb=encodeColorBlock(px,type===96);for(const v of cb)out[p++]=v;
+ }
+ return out;
+}
+function canvasPut(canvas,pixels,w,h){canvas.width=w;canvas.height=h;const ctx=canvas.getContext("2d");ctx.putImageData(new ImageData(pixels,w,h),0,0);}
+function stylize(src,w,h,strength){
+ const out=new Uint8ClampedArray(src),s=strength/100,levels=Math.max(5,Math.round(32-23*s)),sat=1+0.65*s,contrast=1+0.18*s;
+ const lum=new Float32Array(w*h);
+ for(let i=0;i<w*h;i++){const q=i*4;lum[i]=.299*src[q]+.587*src[q+1]+.114*src[q+2];}
+ for(let y=0;y<h;y++)for(let x=0;x<w;x++){const i=y*w+x,q=i*4,a=src[q+3];let r=src[q],g=src[q+1],b=src[q+2],l=.299*r+.587*g+.114*b;
+  r=l+(r-l)*sat;g=l+(g-l)*sat;b=l+(b-l)*sat;
+  r=(r-128)*contrast+128;g=(g-128)*contrast+128;b=(b-128)*contrast+128;
+  const step=255/(levels-1);r=Math.round(Math.max(0,Math.min(255,r))/step)*step;g=Math.round(Math.max(0,Math.min(255,g))/step)*step;b=Math.round(Math.max(0,Math.min(255,b))/step)*step;
+  let edge=0;if(x>0&&x<w-1&&y>0&&y<h-1){const gx=Math.abs(lum[i+1]-lum[i-1]),gy=Math.abs(lum[i+w]-lum[i-w]);edge=Math.min(1,(gx+gy)/150)*s*.32;}
+  out[q]=r*(1-edge);out[q+1]=g*(1-edge);out[q+2]=b*(1-edge);out[q+3]=a;
+ }
+ return out;
+}
+function refresh(){
+ if(selected<0)return;const r=records[selected],s=+$("strength").value;
+ canvasPut($("before"),r.pixels,r.e.width,r.e.height);
+ const filtered=stylize(r.pixels,r.e.width,r.e.height,s);canvasPut($("after"),filtered,r.e.width,r.e.height);
+ $("sv").textContent=s+"%";r.filtered=filtered;
+}
+$("strength").addEventListener("input",refresh);
+$("analyze").onclick=async()=>{
+ records=[];selected=-1;$("convert").disabled=true;$("list").textContent="";
+ const files=[...$("files").files];if(!files.length){$("status").textContent="먼저 FSH 파일을 선택하세요.";return;}
+ for(const file of files){try{const buf=await file.arrayBuffer(),r=parseFSH(buf,file.name);records.push(r);$("list").innerHTML+="<div class='item'><span class='ok'>분석 성공</span> · "+file.name+" · "+r.e.width+"×"+r.e.height+" · DXT"+(r.e.type===96?"1":"3")+" · mip "+r.e.mips+"</div>";}catch(err){$("list").innerHTML+="<div class='item'><span class='bad'>분석 보류</span> · "+file.name+" · "+err.message+"</div>";}}
+ if(records.length){selected=0;$("convert").disabled=false;refresh();$("status").textContent=records.length+"개 파일을 읽었습니다. 미리보기는 첫 번째 파일입니다. 저장 전 강도를 조절하세요.";}else $("status").textContent="지원 가능한 파일이 없습니다.";
+};
+$("convert").onclick=()=>{
+ const s=+$("strength").value;
+ for(const r of records){try{
+  const b=r.bytes.slice(),e=r.e,levels=e.levels;let off=e.dataStart;
+  let base=stylize(r.pixels,e.width,e.height,s);
+  let encoded=encodeLevel(base,levels[0],e.type);b.set(encoded,off);off+=encoded.length;
+  let prev=base,pw=e.width,ph=e.height;
+  for(let i=1;i<levels.length;i++){const lv=levels[i],small=new Uint8ClampedArray(lv.w*lv.h*4);for(let y=0;y<lv.h;y++)for(let x=0;x<lv.w;x++){let sx=Math.min(pw-1,x*2),sy=Math.min(ph-1,y*2),q=(sy*pw+sx)*4,d=(y*lv.w+x)*4;small.set(prev.slice(q,q+4),d);}const enc=encodeLevel(small,lv,e.type);b.set(enc,off);off+=enc.length;prev=small;pw=lv.w;ph=lv.h;}
+  const blob=new Blob([b],{type:"application/octet-stream"}),url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=r.name.replace(/\.fsh$/i,"")+"_toon.fsh";a.click();setTimeout(()=>URL.revokeObjectURL(url),1500);
+ }catch(err){alert(r.name+" 저장 실패: "+err.message);}}
+ $("status").textContent="변환 파일 저장을 요청했습니다. 게임 적용 전 원본 백업본으로 확인하세요.";
+};
+</script></main></body></html>
