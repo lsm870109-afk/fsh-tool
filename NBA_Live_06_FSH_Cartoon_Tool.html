@@ -75,12 +75,9 @@ function decodeLevel(b,e,lv,offset){
   let alpha=null,co;
   if(e.type===96){co=decodeColor(b,p,true);p+=8;}
   else{
-   alpha=[];for(let i=0;i<8;i++)alpha.push(b[p+i]);let ab=0n;for(let i=0;i<6;i++)ab|=BigInt(b[p+2+i])<<BigInt(8*i);
-   const a0=alpha[0],a1=alpha[1],ap=[a0,a1];
-   if(a0>a1){for(let i=1;i<=6;i++)ap.push(((7-i)*a0+i*a1)/7);}
-   else{for(let i=1;i<=4;i++)ap.push(((5-i)*a0+i*a1)/5);ap.push(0,255);}
-   const cols=decodeColor(b,p+8,false);co=cols;
-   for(let i=0;i<16;i++){const ix=Number((ab>>BigInt(3*i))&7n);co[i][3]=Math.round(ap[ix]);}p+=16;
+   let ab=0n;for(let i=0;i<8;i++)ab|=BigInt(b[p+i])<<BigInt(8*i);
+   co=decodeColor(b,p+8,false);
+   for(let i=0;i<16;i++){co[i][3]=Number((ab>>BigInt(4*i))&15n)*17;}p+=16;
   }
   for(let py=0;py<4;py++)for(let px=0;px<4;px++){const x=bx*4+px,y=by*4+py;if(x>=lv.w||y>=lv.h)continue;const c=co[py*4+px],q=(y*lv.w+x)*4;out[q]=c[0];out[q+1]=c[1];out[q+2]=c[2];out[q+3]=c[3];}
  }
